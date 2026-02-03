@@ -1,0 +1,2 @@
+fastmcp==2.14.4
+pyserial==3.5
