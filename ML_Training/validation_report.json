@@ -1,0 +1,25 @@
+{
+  "ml_metrics": {
+    "name": "TFLite ML",
+    "mae": 2.9308845799317895,
+    "rmse": 3.5449571509372833,
+    "mean_error": 0.006606224910120094,
+    "std_error": 3.544950995398077,
+    "r2": 0.816683221155913
+  },
+  "formula_metrics": {
+    "name": "Formula",
+    "mae": 3.9520904111488595,
+    "rmse": 4.7081575542867045,
+    "mean_error": -2.1552381612701934,
+    "std_error": 4.185892500314794,
+    "r2": 0.6766430404477441
+  },
+  "keras_tflite_comparison": {
+    "max_diff": 2.288818359375e-05,
+    "mean_diff": 3.3428523238399066e-06,
+    "percent_diff": 5.1908623390772846e-06
+  },
+  "ml_improvement_dBm": 1.02120583121707,
+  "proceed_to_arduino": false
+}

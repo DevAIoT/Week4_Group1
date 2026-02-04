@@ -61,6 +61,7 @@ class SensorPacket:
 @dataclass(frozen=True)
 class LTESignalRecord:
     """Single CSV record from CRAWDAD Salzburg dataset"""
+
     timestamp: int  # Unix timestamp
     rsrp: int
     rsrq: int
@@ -71,19 +72,20 @@ class LTESignalRecord:
 @dataclass
 class ProcessedRecord:
     """Single processed CSV record from Arduino"""
-    received_at: datetime      # When Python received it
-    timestamp: int             # Original CSV timestamp (Unix)
-    latitude: float            # GPS latitude (degrees)
-    longitude: float           # GPS longitude (degrees)
-    elevation: float           # Altitude above sea level (meters)
-    pci: int                   # Physical Cell Identity (0-503)
-    cell_id: int               # Cell Tower ID
+
+    received_at: datetime  # When Python received it
+    timestamp: int  # Original CSV timestamp (Unix)
+    latitude: float  # GPS latitude (degrees)
+    longitude: float  # GPS longitude (degrees)
+    elevation: float  # Altitude above sea level (meters)
+    pci: int  # Physical Cell Identity (0-503)
+    cell_id: int  # Cell Tower ID
     rsrp: int
     rsrq: int
     rssi: int
     sinr: int
     is_anomaly: bool
-    record_num: int            # Sequential number from Arduino
+    record_num: int  # Sequential number from Arduino
     rssi_is_calculated: bool = False  # Flag if RSSI was calculated by Arduino
 
 
@@ -268,7 +270,9 @@ class StreamController:
             # Keep only last 10000 records (circular buffer)
             if len(self.processed_records) > 10000:
                 self.processed_records.pop(0)
-            logger.info(f"Received processed record #{record.record_num}: RSRP={record.rsrp}, SINR={record.sinr}, anomaly={record.is_anomaly}")
+            logger.info(
+                f"Received processed record #{record.record_num}: RSRP={record.rsrp}, SINR={record.sinr}, anomaly={record.is_anomaly}"
+            )
 
     def _parse_timestamp(self, time_str: str) -> int:
         """Convert timestamp string to Unix timestamp"""
@@ -286,7 +290,7 @@ class StreamController:
                 logger.error(f"CSV file not found: {self.csv_path}")
                 return
 
-            with open(self.csv_path, 'r') as f:
+            with open(self.csv_path, "r") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     if self._stop_event.is_set():
@@ -294,20 +298,20 @@ class StreamController:
 
                     try:
                         # Parse CSV row - extract all fields
-                        timestamp = self._parse_timestamp(row['Time'])
+                        timestamp = self._parse_timestamp(row["Time"])
 
                         # Geographic fields (NEW)
-                        latitude = float(row['Latitude']) if row['Latitude'] else 0.0
-                        longitude = float(row['Longitude']) if row['Longitude'] else 0.0
-                        elevation = float(row['Elevation']) if row['Elevation'] else 0.0
-                        pci = int(float(row['PCI'])) if row['PCI'] else 0
-                        cell_id = int(float(row['Cell_Id'])) if row['Cell_Id'] else 0
+                        latitude = float(row["Latitude"]) if row["Latitude"] else 0.0
+                        longitude = float(row["Longitude"]) if row["Longitude"] else 0.0
+                        elevation = float(row["Elevation"]) if row["Elevation"] else 0.0
+                        pci = int(float(row["PCI"])) if row["PCI"] else 0
+                        cell_id = int(float(row["Cell_Id"])) if row["Cell_Id"] else 0
 
                         # Signal quality fields
-                        rsrp = int(float(row['RSRP'])) if row['RSRP'] else 0
-                        rsrq = int(float(row['RSRQ'])) if row['RSRQ'] else 0
-                        rssi = int(float(row['RSSI'])) if row['RSSI'] else 0
-                        sinr = int(float(row['SINR'])) if row['SINR'] else 0
+                        rsrp = int(float(row["RSRP"])) if row["RSRP"] else 0
+                        rsrq = int(float(row["RSRQ"])) if row["RSRQ"] else 0
+                        rssi = int(float(row["RSSI"])) if row["RSSI"] else 0
+                        sinr = int(float(row["SINR"])) if row["SINR"] else 0
 
                         # Format and send DATA command with all 10 fields
                         msg = f"DATA={timestamp},{latitude},{longitude},{elevation},{pci},{cell_id},{rsrp},{rsrq},{rssi},{sinr}\n"
@@ -392,11 +396,14 @@ class StreamController:
         with self._lock:
             return self.processed_records[-count:] if self.processed_records else []
 
-    def query_by_quality(self, min_rsrp: int = -80, min_sinr: int = 15) -> List[ProcessedRecord]:
+    def query_by_quality(
+        self, min_rsrp: int = -80, min_sinr: int = 15
+    ) -> List[ProcessedRecord]:
         """Query records filtered by signal quality thresholds"""
         with self._lock:
             return [
-                r for r in self.processed_records
+                r
+                for r in self.processed_records
                 if r.rsrp >= min_rsrp and r.sinr >= min_sinr
             ]
 
@@ -460,9 +467,6 @@ CSV_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Crawdad.csv
 stream_controller = StreamController(board, CSV_PATH)
 
 ArduinoMCP = FastMCP("Arduino Servers")
-
-
-# @ArduinoMCP.tool is a python decorator which is wrapping our functions to be exposed to the MCP Client
 
 
 @ArduinoMCP.tool
@@ -532,6 +536,7 @@ def get_current_humidity():
 
 # --- CSV Streaming Control Tools ---
 
+
 @ArduinoMCP.tool
 def start_csv_stream(rate_limit: int = 20):
     """
@@ -577,6 +582,7 @@ def get_stream_status():
 
 # --- CSV Data Query Tools ---
 
+
 @ArduinoMCP.tool
 def get_latest_results(count: int = 5):
     """
@@ -599,7 +605,7 @@ def get_latest_results(count: int = 5):
     records_list = [asdict(r) for r in records]
     # Convert datetime to ISO format string
     for r in records_list:
-        r['received_at'] = r['received_at'].isoformat()
+        r["received_at"] = r["received_at"].isoformat()
 
     return json.dumps(records_list, indent=2)
 
@@ -625,9 +631,12 @@ def query_results_by_quality(min_rsrp: int = -80, min_sinr: int = 15):
     sample = records[:10]
     sample_list = [asdict(r) for r in sample]
     for r in sample_list:
-        r['received_at'] = r['received_at'].isoformat()
+        r["received_at"] = r["received_at"].isoformat()
 
-    return f"Found {len(records)} records with good signal quality (RSRP >= {min_rsrp} dBm, SINR >= {min_sinr} dB). Sample of first 10:\n" + json.dumps(sample_list, indent=2)
+    return (
+        f"Found {len(records)} records with good signal quality (RSRP >= {min_rsrp} dBm, SINR >= {min_sinr} dB). Sample of first 10:\n"
+        + json.dumps(sample_list, indent=2)
+    )
 
 
 @ArduinoMCP.tool
@@ -647,9 +656,11 @@ def get_anomaly_records():
     # Convert to JSON-serializable format
     anomalies_list = [asdict(r) for r in anomalies]
     for r in anomalies_list:
-        r['received_at'] = r['received_at'].isoformat()
+        r["received_at"] = r["received_at"].isoformat()
 
-    return f"Found {len(anomalies)} anomaly records:\n" + json.dumps(anomalies_list, indent=2)
+    return f"Found {len(anomalies)} anomaly records:\n" + json.dumps(
+        anomalies_list, indent=2
+    )
 
 
 @ArduinoMCP.tool
@@ -664,7 +675,9 @@ def get_signal_quality_stats():
     stats = stream_controller.get_signal_quality_stats()
 
     if "error" in stats:
-        return "No statistics available yet. Start streaming first with start_csv_stream()"
+        return (
+            "No statistics available yet. Start streaming first with start_csv_stream()"
+        )
 
     return json.dumps(stats, indent=2)
 
@@ -693,16 +706,20 @@ def get_rssi_calculation_stats():
             "total_records": len(records),
             "measured_rssi_count": len(measured),
             "calculated_rssi_count": len(calculated),
-            "calculated_percentage": round(
-                len(calculated) / len(records) * 100, 2
-            ) if records else 0,
-            "measured_rssi_avg": round(
-                sum(r.rssi for r in measured) / len(measured), 2
-            ) if measured else None,
-            "calculated_rssi_avg": round(
-                sum(r.rssi for r in calculated) / len(calculated), 2
-            ) if calculated else None,
-            "formula": "RSSI = RSRP - RSRQ + 14 (calculated on Arduino)"
+            "calculated_percentage": (
+                round(len(calculated) / len(records) * 100, 2) if records else 0
+            ),
+            "measured_rssi_avg": (
+                round(sum(r.rssi for r in measured) / len(measured), 2)
+                if measured
+                else None
+            ),
+            "calculated_rssi_avg": (
+                round(sum(r.rssi for r in calculated) / len(calculated), 2)
+                if calculated
+                else None
+            ),
+            "formula": "RSSI = RSRP - RSRQ + 14 (calculated on Arduino)",
         }
 
         return json.dumps(stats, indent=2)

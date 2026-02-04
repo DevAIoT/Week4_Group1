@@ -4,6 +4,21 @@
 #include <Arduino_BMI270_BMM150.h>
 #include <Arduino_JSON.h>
 
+// TensorFlow Lite for RSSI prediction
+#include <TensorFlowLite.h>
+#include <tensorflow/lite/micro/all_ops_resolver.h>
+#include <tensorflow/lite/micro/micro_interpreter.h>
+#include <tensorflow/lite/micro/micro_log.h>
+#include <tensorflow/lite/micro/system_setup.h>
+#include <tensorflow/lite/schema/schema_generated.h>
+
+// ML model and configuration
+#include "rssi_model.h"
+#include "model_config.h"
+
+// ML prediction mode: true = use ML, false = use formula
+#define USE_ML_PREDICTION true
+
 const int LED_PIN = LED_BUILTIN;
 
 // Do not use names LEDR/LEDG/LEDB (these are macros)!
@@ -12,6 +27,21 @@ const int RGB_G = LEDG;  // (23u)
 const int RGB_B = LEDB;  // (24u)
 
 String cmd;
+
+// --- TensorFlow Lite Global Variables ---
+namespace {
+  const tflite::Model* tflite_model = nullptr;
+  tflite::MicroInterpreter* tflite_interpreter = nullptr;
+  TfLiteTensor* tflite_input = nullptr;
+  TfLiteTensor* tflite_output = nullptr;
+
+  // Tensor arena for intermediate arrays
+  constexpr int kTensorArenaSize = TFLITE_ARENA_SIZE;
+  alignas(16) uint8_t tensor_arena[kTensorArenaSize];
+
+  // Model initialization status
+  bool ml_model_ready = false;
+}
 
 // --- CSV Streaming Data Structures ---
 struct CSVRecord {
@@ -61,6 +91,89 @@ int8_t calculateRSSI(int8_t rsrp, int8_t rsrq) {
   if (calculated > -25) calculated = -25;
 
   return (int8_t)calculated;
+}
+
+// Normalize feature value using StandardScaler parameters
+float normalizeFeature(float value, int feature_idx) {
+  return (value - feature_means[feature_idx]) / feature_scales[feature_idx];
+}
+
+// ML-based RSSI prediction
+int8_t predictRSSI_ML(int8_t rsrp, int8_t rsrq, int8_t sinr,
+                       float latitude, float longitude, float elevation) {
+  // Fallback to formula if ML not ready
+  if (!ml_model_ready || !USE_ML_PREDICTION) {
+    return calculateRSSI(rsrp, rsrq);
+  }
+
+  // Normalize input features (order: RSRP, RSRQ, SINR, Lat, Lon, Elev)
+  tflite_input->data.f[0] = normalizeFeature((float)rsrp, 0);
+  tflite_input->data.f[1] = normalizeFeature((float)rsrq, 1);
+  tflite_input->data.f[2] = normalizeFeature((float)sinr, 2);
+  tflite_input->data.f[3] = normalizeFeature(latitude, 3);
+  tflite_input->data.f[4] = normalizeFeature(longitude, 4);
+  tflite_input->data.f[5] = normalizeFeature(elevation, 5);
+
+  // Run inference
+  TfLiteStatus invoke_status = tflite_interpreter->Invoke();
+  if (invoke_status != kTfLiteOk) {
+    Serial.println("ERR=ML_INFERENCE_FAILED");
+    // Fallback to formula on error
+    return calculateRSSI(rsrp, rsrq);
+  }
+
+  // Get prediction
+  float rssi_predicted = tflite_output->data.f[0];
+
+  // Clamp to valid RSSI range
+  if (rssi_predicted < RSSI_MIN) rssi_predicted = RSSI_MIN;
+  if (rssi_predicted > RSSI_MAX) rssi_predicted = RSSI_MAX;
+
+  return (int8_t)round(rssi_predicted);
+}
+
+// Initialize TensorFlow Lite model
+bool initMLModel() {
+  // Load model
+  tflite_model = tflite::GetModel(rssi_model_tflite);
+  if (tflite_model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.print("ERR=TFLITE_VERSION_MISMATCH,MODEL=");
+    Serial.print(tflite_model->version());
+    Serial.print(",EXPECTED=");
+    Serial.println(TFLITE_SCHEMA_VERSION);
+    return false;
+  }
+
+  // Create ops resolver (includes all operations)
+  static tflite::AllOpsResolver resolver;
+
+  // Build interpreter
+  static tflite::MicroInterpreter static_interpreter(
+      tflite_model, resolver, tensor_arena, kTensorArenaSize);
+  tflite_interpreter = &static_interpreter;
+
+  // Allocate tensors
+  TfLiteStatus allocate_status = tflite_interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+    Serial.println("ERR=TFLITE_ALLOC_FAILED");
+    return false;
+  }
+
+  // Get input/output tensors
+  tflite_input = tflite_interpreter->input(0);
+  tflite_output = tflite_interpreter->output(0);
+
+  // Verify tensor dimensions
+  if (tflite_input->dims->size != 2 || tflite_input->dims->data[1] != NUM_FEATURES) {
+    Serial.print("ERR=TFLITE_INPUT_DIM,EXPECTED=");
+    Serial.print(NUM_FEATURES);
+    Serial.print(",GOT=");
+    Serial.println(tflite_input->dims->data[1]);
+    return false;
+  }
+
+  Serial.println("INFO=TFLITE_READY");
+  return true;
 }
 
 void sendProcessedRecord(CSVRecord& rec, bool is_anomaly) {
@@ -179,8 +292,9 @@ void handleCommand(const String& s) {
 
       // Check if RSSI is missing (Python sends 0 for missing values)
       if (rssi_int == 0) {
-        // Calculate RSSI using formula
-        rec.rssi = calculateRSSI(rec.rsrp, rec.rsrq);
+        // Predict RSSI using ML model (or formula as fallback)
+        rec.rssi = predictRSSI_ML(rec.rsrp, rec.rsrq, rec.sinr,
+                                   rec.latitude, rec.longitude, rec.elevation);
         rec.rssi_is_calculated = true;
       } else {
         // Use measured RSSI from CSV
@@ -223,6 +337,12 @@ void setup() {
   if (!ok) {
     Serial.println("ERR=INIT_FAILED");
     while (1) {}
+  }
+
+  // Initialize TensorFlow Lite model for RSSI prediction
+  ml_model_ready = initMLModel();
+  if (!ml_model_ready) {
+    Serial.println("WARN=ML_INIT_FAILED,USING_FORMULA");
   }
 
   Serial.println("READY");
