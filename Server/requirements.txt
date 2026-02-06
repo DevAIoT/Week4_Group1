@@ -1,2 +1,4 @@
 fastmcp==2.14.4
 pyserial==3.5
+folium==0.15.1
+duckdb>=0.9.0

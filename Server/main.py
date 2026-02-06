@@ -10,14 +10,19 @@ import queue
 import logging
 import csv
 import os
+import folium
+import duckdb
+import tempfile
+import webbrowser
+from pathlib import Path
 
-from typing import Optional, Callable, Any, Dict, List
+from typing import Optional, Callable, Any, Dict, List, Tuple
 
 logger = logging.getLogger("devaiot-mcp")
 logger.setLevel(logging.DEBUG)
 
 
-PORT = "COM3"  # Change to your COM port
+PORT = "COM5"  # Change to your COM port
 
 
 @dataclass(frozen=True)
@@ -155,7 +160,20 @@ class Nano33SenseRev2:
         on_processed_record: Optional[Callable[[ProcessedRecord], None]] = None,
         debug_nonjson: bool = False,
     ):
-        self.ser = serial.Serial(port, baud, timeout=1)
+        self.ser = None
+        self.connected = False
+        
+        try:
+            self.ser = serial.Serial(port, baud, timeout=1)
+            self.connected = True
+            logger.info(f"Successfully connected to Arduino on {port}")
+        except serial.SerialException as e:
+            logger.warning(f"Failed to connect to Arduino on {port}: {e}")
+            logger.warning("Continuing without Arduino connection")
+        except Exception as e:
+            logger.warning(f"Unexpected error connecting to Arduino: {e}")
+            logger.warning("Continuing without Arduino connection")
+        
         self.on_packet = on_packet
         self.on_processed_record = on_processed_record
         self.debug_nonjson = debug_nonjson
@@ -163,17 +181,24 @@ class Nano33SenseRev2:
 
         self._latest_pkt = queue.Queue(maxsize=1)
 
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
+        if self.connected:
+            self._thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._thread.start()
+        else:
+            self._thread = None
 
     # ----- commands -----
     def led_on(self) -> None:
-        self._send("LED=ON")
+        if self.connected:
+            self._send("LED=ON")
 
     def led_off(self) -> None:
-        self._send("LED=OFF")
+        if self.connected:
+            self._send("LED=OFF")
 
     def rgb(self, r: int, g: int, b: int) -> None:
+        if not self.connected:
+            return
         r = max(0, min(255, int(r)))
         g = max(0, min(255, int(g)))
         b = max(0, min(255, int(b)))
@@ -202,9 +227,14 @@ class Nano33SenseRev2:
 
     # ----- internals -----
     def _send(self, msg: str) -> None:
+        if not self.connected or self.ser is None:
+            return
         if not msg.endswith("\n"):
             msg += "\n"
-        self.ser.write(msg.encode("utf-8"))
+        try:
+            self.ser.write(msg.encode("utf-8"))
+        except Exception as e:
+            logger.warning(f"Error sending message to Arduino: {e}")
 
     def _set_latest_package(self, pkt: SensorPacket) -> None:
         clear_queue(self._latest_pkt)
@@ -240,10 +270,14 @@ class Nano33SenseRev2:
     def close(self) -> None:
         self._running = False
         time.sleep(0.1)
-        try:
-            self.ser.close()
-        except Exception:
-            pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        if self.ser is not None and self.connected:
+            try:
+                self.ser.close()
+                self.connected = False
+            except Exception as e:
+                logger.warning(f"Error closing serial connection: {e}")
 
 
 class StreamController:
@@ -469,73 +503,7 @@ stream_controller = StreamController(board, CSV_PATH)
 ArduinoMCP = FastMCP("Arduino Servers")
 
 
-@ArduinoMCP.tool
-def red_led_ON():
-    """Turns on red LED in the Arduino"""
-    board.red_LED()
-    time.sleep(2)
-    board.off()
-    return "Red LED could not be turned on – exept for two seconds"
-
-
-@ArduinoMCP.tool
-def led_OFF():
-    """Turns off all LEDs in the Arduino"""
-    board.off()
-    return "All LEDs OFF"
-
-
-@ArduinoMCP.tool
-def get_current_temperature():
-    """Gets the most recent temperature from the Arduino"""
-    state = board.get_state()
-    if state:
-        return str(state.hs3003_t_c) + " degrees celsius"
-    else:
-        return None
-
-
-@ArduinoMCP.tool
-def get_current_gyro():
-    """Gets the most recent temperature from the Arduino"""
-    state = board.get_state()
-    if state:
-        return str(state.gyro_dps)
-    else:
-        return None
-
-
-@ArduinoMCP.tool
-def get_current_accelerometer():
-    """Gets the most recent temperature from the Arduino"""
-    state = board.get_state()
-    if state:
-        return str(state.acc_g)
-    else:
-        return None
-
-
-@ArduinoMCP.tool
-def blue_led_ON():
-    """Turns on blue LED in the Arduino"""
-    board.blue_LED()
-    time.sleep(2)
-    board.off()
-    return "Blue LED could not be turned on – exept for two seconds"
-
-
-@ArduinoMCP.tool
-def get_current_humidity():
-    """Gets the most recent humidity reading from the Arduino"""
-    state = board.get_state()
-    if state:
-        return str(state.hs3003_h_rh) + "% relative humidity"
-    else:
-        return None
-
-
 # --- CSV Streaming Control Tools ---
-
 
 @ArduinoMCP.tool
 def start_csv_stream(rate_limit: int = 20):
@@ -640,30 +608,6 @@ def query_results_by_quality(min_rsrp: int = -80, min_sinr: int = 15):
 
 
 @ArduinoMCP.tool
-def get_anomaly_records():
-    """
-    Get all individual records flagged as anomalies (poor signal quality).
-    Anomalies are defined as RSRP < -100 dBm OR SINR < 0 dB.
-
-    Returns:
-        JSON array of all anomaly records with their signal data
-    """
-    anomalies = stream_controller.get_anomaly_records()
-
-    if not anomalies:
-        return "No anomalies detected yet. Anomalies are defined as RSRP < -100 dBm or SINR < 0 dB"
-
-    # Convert to JSON-serializable format
-    anomalies_list = [asdict(r) for r in anomalies]
-    for r in anomalies_list:
-        r["received_at"] = r["received_at"].isoformat()
-
-    return f"Found {len(anomalies)} anomaly records:\n" + json.dumps(
-        anomalies_list, indent=2
-    )
-
-
-@ArduinoMCP.tool
 def get_signal_quality_stats():
     """
     Compute and return aggregated statistics from all stored individual records.
@@ -725,6 +669,676 @@ def get_rssi_calculation_stats():
         return json.dumps(stats, indent=2)
 
 
+@ArduinoMCP.tool
+def retrieve_csv_data(
+    limit: int = 100,
+    offset: int = 0,
+    start_time: str = "",
+    end_time: str = "",
+    min_latitude: float = -90.0,
+    max_latitude: float = 90.0,
+    min_longitude: float = -180.0,
+    max_longitude: float = 180.0,
+    min_rsrp: int = -200,
+    max_rsrp: int = 0,
+    min_rsrq: int = -50,
+    max_rsrq: int = 0,
+    min_rssi: int = -200,
+    max_rssi: int = 0,
+    min_sinr: int = -50,
+    max_sinr: int = 100,
+    pci: int = -1,
+    cell_id: int = -1,
+    rssi_generated_only: bool = False,
+) -> str:
+    """
+    Retrieve and filter data from Crawdad_filled.csv with advanced filtering.
+
+    Args:
+        limit: Maximum number of records to return (default 100, max 10000)
+        offset: Number of records to skip (for pagination)
+        start_time: Filter records after this time (format: "YYYY-MM-DD HH:MM:SS")
+        end_time: Filter records before this time (format: "YYYY-MM-DD HH:MM:SS")
+        min_latitude: Minimum latitude filter
+        max_latitude: Maximum latitude filter
+        min_longitude: Minimum longitude filter
+        max_longitude: Maximum longitude filter
+        min_rsrp: Minimum RSRP threshold (dBm)
+        max_rsrp: Maximum RSRP threshold (dBm)
+        min_rsrq: Minimum RSRQ threshold (dB)
+        max_rsrq: Maximum RSRQ threshold (dB)
+        min_rssi: Minimum RSSI threshold (dBm)
+        max_rssi: Maximum RSSI threshold (dBm)
+        min_sinr: Minimum SINR threshold (dB)
+        max_sinr: Maximum SINR threshold (dB)
+        pci: Filter by specific PCI (-1 for all)
+        cell_id: Filter by specific Cell ID (-1 for all)
+        rssi_generated_only: If True, only return records with RSSI_Generated=1.0
+
+    Returns:
+        JSON array of filtered records with metadata
+    """
+    # Define CSV path
+    csv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Crawdad_filled.csv")
+
+    # Validate inputs
+    limit = min(max(1, limit), 10000)
+    offset = max(0, offset)
+
+    # Check if CSV file exists
+    if not os.path.exists(csv_path):
+        return json.dumps({
+            "status": "error",
+            "message": f"CSV file not found: {csv_path}"
+        }, indent=2)
+
+    # Validate time formats if provided
+    if start_time:
+        try:
+            datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+        except ValueError as e:
+            return json.dumps({
+                "status": "error",
+                "message": f"Invalid start_time format: {e}. Expected 'YYYY-MM-DD HH:MM:SS'"
+            }, indent=2)
+
+    if end_time:
+        try:
+            datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
+        except ValueError as e:
+            return json.dumps({
+                "status": "error",
+                "message": f"Invalid end_time format: {e}. Expected 'YYYY-MM-DD HH:MM:SS'"
+            }, indent=2)
+
+    # Use DuckDB for efficient CSV querying
+    try:
+        # Initialize DuckDB connection (in-memory)
+        conn = duckdb.connect(':memory:')
+
+        # Build dynamic SQL query with WHERE clauses
+        where_clauses = []
+
+        # Time range filters
+        if start_time:
+            where_clauses.append(f"Time >= '{start_time}'")
+        if end_time:
+            where_clauses.append(f"Time <= '{end_time}'")
+
+        # Geographic bounds
+        if min_latitude != -90.0:
+            where_clauses.append(f"Latitude >= {min_latitude}")
+        if max_latitude != 90.0:
+            where_clauses.append(f"Latitude <= {max_latitude}")
+        if min_longitude != -180.0:
+            where_clauses.append(f"Longitude >= {min_longitude}")
+        if max_longitude != 180.0:
+            where_clauses.append(f"Longitude <= {max_longitude}")
+
+        # Signal quality thresholds
+        if min_rsrp != -200:
+            where_clauses.append(f"RSRP >= {min_rsrp}")
+        if max_rsrp != 0:
+            where_clauses.append(f"RSRP <= {max_rsrp}")
+        if min_rsrq != -50:
+            where_clauses.append(f"RSRQ >= {min_rsrq}")
+        if max_rsrq != 0:
+            where_clauses.append(f"RSRQ <= {max_rsrq}")
+        if min_rssi != -200:
+            where_clauses.append(f"RSSI >= {min_rssi}")
+        if max_rssi != 0:
+            where_clauses.append(f"RSSI <= {max_rssi}")
+        if min_sinr != -50:
+            where_clauses.append(f"SINR >= {min_sinr}")
+        if max_sinr != 100:
+            where_clauses.append(f"SINR <= {max_sinr}")
+
+        # Cell information filters
+        if pci != -1:
+            where_clauses.append(f"CAST(PCI AS INTEGER) = {pci}")
+        if cell_id != -1:
+            where_clauses.append(f"CAST(Cell_Id AS INTEGER) = {cell_id}")
+
+        # RSSI_Generated filter
+        if rssi_generated_only:
+            where_clauses.append("RSSI_Generated = 1.0")
+
+        # Build WHERE clause
+        where_sql = ""
+        if where_clauses:
+            where_sql = " WHERE " + " AND ".join(where_clauses)
+
+        # Get total count of matched records
+        count_sql = f"SELECT COUNT(*) FROM read_csv_auto('{csv_path}'){where_sql}"
+        total_matched = conn.execute(count_sql).fetchone()[0]
+
+        # Get paginated records
+        data_sql = f"SELECT * FROM read_csv_auto('{csv_path}'){where_sql} LIMIT {limit} OFFSET {offset}"
+        result = conn.execute(data_sql).fetchall()
+        columns = [desc[0] for desc in conn.description]
+
+        # Convert to list of dicts
+        paginated_records = []
+        for row in result:
+            record = {}
+            for i, col in enumerate(columns):
+                value = row[i]
+                # Cast to appropriate types
+                if col == "Time":
+                    # Convert datetime to string format
+                    record[col] = value.strftime("%Y-%m-%d %H:%M:%S") if isinstance(value, datetime) else str(value)
+                elif col in ["Latitude", "Longitude", "Elevation", "RSSI_Generated"]:
+                    record[col] = float(value) if value is not None else 0.0
+                elif col in ["PCI", "Cell_Id", "RSRP", "RSRQ", "RSSI", "SINR"]:
+                    record[col] = int(float(value)) if value is not None else 0
+                else:
+                    record[col] = value
+            paginated_records.append(record)
+
+        conn.close()
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Error querying CSV file: {e}"
+        }, indent=2)
+
+    # Build filters_applied summary
+    filters_applied = {}
+
+    if start_time or end_time:
+        time_range = f"{start_time or 'any'} to {end_time or 'any'}"
+        filters_applied["time_range"] = time_range
+
+    if min_latitude != -90.0 or max_latitude != 90.0 or min_longitude != -180.0 or max_longitude != 180.0:
+        filters_applied["location_bounds"] = {
+            "latitude": [min_latitude, max_latitude],
+            "longitude": [min_longitude, max_longitude]
+        }
+
+    if min_rsrp != -200 or max_rsrp != 0 or min_rsrq != -50 or max_rsrq != 0 or min_rssi != -200 or max_rssi != 0 or min_sinr != -50 or max_sinr != 100:
+        filters_applied["signal_quality"] = {
+            "rsrp_range": [min_rsrp, max_rsrp],
+            "rsrq_range": [min_rsrq, max_rsrq],
+            "rssi_range": [min_rssi, max_rssi],
+            "sinr_range": [min_sinr, max_sinr]
+        }
+
+    if pci != -1:
+        filters_applied["pci"] = pci
+
+    if cell_id != -1:
+        filters_applied["cell_id"] = cell_id
+
+    if rssi_generated_only:
+        filters_applied["rssi_generated_only"] = True
+
+    # Return JSON response
+    result = {
+        "status": "success",
+        "total_matched": total_matched,
+        "returned_count": len(paginated_records),
+        "offset": offset,
+        "limit": limit,
+        "filters_applied": filters_applied,
+        "records": paginated_records
+    }
+
+    return json.dumps(result, indent=2)
+
+
+@ArduinoMCP.tool
+def query_csv_data(sql_query: str, limit: int = 256) -> str:
+    """
+    Execute a custom SQL query on the Crawdad_filled.csv dataset using DuckDB.
+    
+    Only SELECT statements are allowed for safety. The CSV file is automatically 
+    available as a table that can be queried directly.
+    
+    Args:
+        sql_query: Custom SQL SELECT query to execute. Must start with SELECT.
+        limit: Maximum number of rows to return (default 256, max 10000)
+    
+    Example queries:
+        - "SELECT Time, Latitude, Longitude, RSRP FROM crawdad WHERE RSRP > -80"
+        - "SELECT AVG(RSRP), COUNT(*) FROM crawdad GROUP BY PCI"
+        - "SELECT * FROM crawdad WHERE Latitude BETWEEN 47.0 AND 47.1 ORDER BY Time LIMIT 50"
+        - "SELECT Time, RSRP, RSSI, (RSRP - RSRQ + 14) as calculated_rssi FROM crawdad WHERE RSSI_Generated = 1.0"
+        - "SELECT PCI, AVG(SINR) as avg_sinr, COUNT(*) as measurements FROM crawdad GROUP BY PCI HAVING COUNT(*) > 100"
+    
+    Returns:
+        JSON with query results, metadata, and execution status
+    """
+    # Validate inputs
+    limit = min(max(1, limit), 10000)
+    sql_query = sql_query.strip()
+    
+    # Check if query starts with SELECT (case-insensitive)
+    if not sql_query.lower().startswith('select'):
+        return json.dumps({
+            "status": "error",
+            "message": "Only SELECT queries are allowed for security reasons. Query must start with 'SELECT'."
+        }, indent=2)
+    
+    # Define CSV path
+    csv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Crawdad_filled.csv")
+    
+    # Check if CSV file exists
+    if not os.path.exists(csv_path):
+        return json.dumps({
+            "status": "error", 
+            "message": f"CSV file not found: {csv_path}"
+        }, indent=2)
+    
+    try:
+        # Initialize DuckDB connection (in-memory)
+        conn = duckdb.connect(':memory:')
+        
+        # Create a virtual table alias for easier querying
+        # Replace common table references with the actual CSV path
+        processed_query = sql_query
+        
+        # Replace common table names with the actual CSV file reference
+        table_aliases = ['crawdad', 'data', 'csv', 'table']
+        csv_reference = f"read_csv_auto('{csv_path}')"
+        
+        for alias in table_aliases:
+            # Case-insensitive replacement
+            import re
+            pattern = r'\b' + re.escape(alias) + r'\b'
+            processed_query = re.sub(pattern, csv_reference, processed_query, flags=re.IGNORECASE)
+        
+        # If no table alias was found, assume they want to query the entire CSV
+        if not any(alias.lower() in processed_query.lower() for alias in table_aliases):
+            # Look for FROM clause and replace with CSV reference
+            from_match = re.search(r'\bfrom\s+(\w+)', processed_query, re.IGNORECASE)
+            if from_match:
+                table_name = from_match.group(1)
+                processed_query = re.sub(
+                    r'\bfrom\s+' + re.escape(table_name) + r'\b', 
+                    f'FROM {csv_reference}', 
+                    processed_query, 
+                    flags=re.IGNORECASE
+                )
+        
+        # Add LIMIT if not already present and limit is specified
+        if limit < 10000 and 'limit' not in processed_query.lower():
+            processed_query += f" LIMIT {limit}"
+        
+        # Execute the query
+        result = conn.execute(processed_query).fetchall()
+        columns = [desc[0] for desc in conn.description]
+        
+        # Convert to list of dicts
+        records = []
+        for row in result:
+            record = {}
+            for i, col in enumerate(columns):
+                value = row[i]
+                # Handle datetime conversion
+                if isinstance(value, datetime):
+                    record[col] = value.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    record[col] = value
+            records.append(record)
+        
+        conn.close()
+        
+        # Return successful result
+        return json.dumps({
+            "status": "success", 
+            "query_executed": processed_query,
+            "columns": columns,
+            "row_count": len(records),
+            "limit_applied": limit,
+            "records": records
+        }, indent=2)
+        
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Query execution failed: {str(e)}",
+            "query_attempted": processed_query
+        }, indent=2)
+
+
+def get_color_for_metric(value: float, metric: str) -> str:
+    """Map signal quality metric to HTML color code"""
+    if metric == "rsrp":
+        if value >= -80:
+            return "#00ff00"  # Green - excellent signal
+        elif value >= -100:
+            return "#ffff00"  # Yellow - fair signal
+        else:
+            return "#ff0000"  # Red - poor signal
+    elif metric == "sinr":
+        if value >= 15:
+            return "#00ff00"  # Green - excellent
+        elif value >= 0:
+            return "#ffff00"  # Yellow - fair
+        else:
+            return "#ff0000"  # Red - poor
+    elif metric == "rsrq":
+        if value >= -10:
+            return "#00ff00"  # Green - excellent
+        elif value >= -15:
+            return "#ffff00"  # Yellow - fair
+        else:
+            return "#ff0000"  # Red - poor
+    elif metric == "rssi":
+        if value >= -65:
+            return "#00ff00"  # Green - excellent
+        elif value >= -85:
+            return "#ffff00"  # Yellow - fair
+        else:
+            return "#ff0000"  # Red - poor
+    elif metric == "anomaly":
+        return "#ff0000" if value else "#00ff00"  # Red if anomaly, green if not
+    else:
+        return "#0000ff"  # Blue - unknown metric
+
+
+def _get_record_field(record, field: str):
+    """
+    Safely access a field from either ProcessedRecord or CSV dict format.
+
+    Args:
+        record: Either a ProcessedRecord object or a dict from retrieve_csv_data
+        field: Field name (ProcessedRecord attribute name)
+
+    Returns:
+        Field value with appropriate type conversion
+    """
+    # Check if it's a ProcessedRecord (has __dataclass_fields__)
+    if hasattr(record, '__dataclass_fields__'):
+        return getattr(record, field)
+
+    # Otherwise it's a dict from CSV - map field names
+    field_mapping = {
+        'latitude': 'Latitude',
+        'longitude': 'Longitude',
+        'elevation': 'Elevation',
+        'rsrp': 'RSRP',
+        'rsrq': 'RSRQ',
+        'rssi': 'RSSI',
+        'sinr': 'SINR',
+        'pci': 'PCI',
+        'cell_id': 'Cell_Id',
+    }
+
+    # Special handling for derived fields
+    if field == 'is_anomaly':
+        return False  # CSV data has no anomaly detection
+    elif field == 'rssi_is_calculated':
+        return record.get('RSSI_Generated', 0.0) == 1.0
+    elif field == 'timestamp':
+        # Parse Time string to Unix timestamp
+        time_str = record.get('Time', '')
+        try:
+            dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+            return int(dt.timestamp())
+        except (ValueError, AttributeError):
+            return int(datetime.now().timestamp())
+    elif field == 'record_num':
+        # Use pre-computed index from dict
+        return record.get('_record_num', 0)
+
+    # Regular field mapping
+    csv_field = field_mapping.get(field, field)
+    return record.get(csv_field, 0)
+
+
+def create_popup_html(record) -> str:
+    """Generate HTML popup content for a data point"""
+    timestamp = _get_record_field(record, 'timestamp')
+    timestamp_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+    record_num = _get_record_field(record, 'record_num')
+
+    html = f"""
+    <div style="font-family: monospace; font-size: 12px;">
+        <b>Timestamp:</b> {timestamp_str}<br>
+        <b>Record #:</b> {record_num}<br>
+        <hr style="margin: 5px 0;">
+        <b>GPS Coordinates:</b><br>
+        &nbsp;&nbsp;Lat: {_get_record_field(record, 'latitude'):.6f}°<br>
+        &nbsp;&nbsp;Lon: {_get_record_field(record, 'longitude'):.6f}°<br>
+        &nbsp;&nbsp;Elevation: {_get_record_field(record, 'elevation'):.1f}m<br>
+        <hr style="margin: 5px 0;">
+        <b>Signal Quality:</b><br>
+        &nbsp;&nbsp;RSRP: {_get_record_field(record, 'rsrp')} dBm<br>
+        &nbsp;&nbsp;RSRQ: {_get_record_field(record, 'rsrq')} dB<br>
+        &nbsp;&nbsp;RSSI: {_get_record_field(record, 'rssi')} dBm {("(calc)" if _get_record_field(record, 'rssi_is_calculated') else "(meas)")}<br>
+        &nbsp;&nbsp;SINR: {_get_record_field(record, 'sinr')} dB<br>
+        <hr style="margin: 5px 0;">
+        <b>Cell Info:</b><br>
+        &nbsp;&nbsp;PCI: {_get_record_field(record, 'pci')}<br>
+        &nbsp;&nbsp;Cell ID: {_get_record_field(record, 'cell_id')}<br>
+        <hr style="margin: 5px 0;">
+        <b>Anomaly:</b> <span style="color: {'red' if _get_record_field(record, 'is_anomaly') else 'green'}; font-weight: bold;">
+        {('YES' if _get_record_field(record, 'is_anomaly') else 'NO')}</span>
+    </div>
+    """
+    return html
+
+
+def calculate_map_center(records) -> Tuple[float, float]:
+    """Calculate geographic centroid for map centering"""
+    if not records:
+        return (0.0, 0.0)
+
+    avg_lat = sum(_get_record_field(r, 'latitude') for r in records) / len(records)
+    avg_lon = sum(_get_record_field(r, 'longitude') for r in records) / len(records)
+    return (avg_lat, avg_lon)
+
+
+
+
+@ArduinoMCP.tool
+def plot_signal_map(
+    color_by: str = "rsrp",
+    show_anomalies_only: bool = False,
+    max_points: int = 10000,
+    output_format: str = "html",
+    records_json: str = ""
+) -> str:
+    """
+    Plot GPS data collection path on an interactive map with signal quality visualization.
+
+    Args:
+        color_by: Metric for color coding ('rsrp', 'sinr', 'rsrq', 'rssi', 'anomaly')
+        show_anomalies_only: If True, only plot anomaly records
+        max_points: Maximum points to plot (default 10000)
+        output_format: Output format ('html' for interactive)
+        records_json: Optional JSON string from retrieve_csv_data. If provided, plots this data
+                      instead of Arduino streaming data. Pass the complete JSON output from
+                      retrieve_csv_data to visualize filtered CSV data without Arduino streaming.
+
+    Returns:
+        JSON with map file path, statistics, and success message
+    """
+    # Determine data source and track if using CSV format
+    using_csv_format = False
+    if records_json:
+        # Use data from retrieve_csv_data (keep as dicts)
+        try:
+            data = json.loads(records_json)
+            if not isinstance(data, dict):
+                return json.dumps({
+                    "status": "error",
+                    "message": "records_json must be a JSON object with 'status' and 'records' fields, not a list"
+                }, indent=2)
+            if data.get("status") != "success":
+                return json.dumps({
+                    "status": "error",
+                    "message": f"Input JSON has error status: {data.get('message', 'Unknown error')}"
+                }, indent=2)
+            records = data["records"]  # Keep as dicts
+            using_csv_format = True
+
+            # Add index-based record_num to each dict
+            for idx, record in enumerate(records):
+                record['_record_num'] = idx + 1
+        except (json.JSONDecodeError, KeyError) as e:
+            return json.dumps({
+                "status": "error",
+                "message": f"Invalid records_json format: {e}"
+            }, indent=2)
+    else:
+        # Use existing stream controller data (ProcessedRecord objects)
+        with stream_controller._lock:
+            records = list(stream_controller.processed_records)
+
+    # Check if we have data
+    if not records:
+        return json.dumps({
+            "status": "error",
+            "message": "No records available yet. Start streaming first with start_csv_stream() or pass records_json from retrieve_csv_data()"
+        }, indent=2)
+
+    # Filter records
+    filtered_records = []
+    for record in records:
+
+        # Validate coordinates (skip invalid GPS data)
+        lat = _get_record_field(record, 'latitude')
+        lon = _get_record_field(record, 'longitude')
+        if lat == 0.0 and lon == 0.0:
+            continue
+
+        filtered_records.append(record)
+
+    # Limit to max_points by sampling evenly
+    if len(filtered_records) > max_points:
+        step = len(filtered_records) / max_points
+        sampled_records = [filtered_records[int(i * step)] for i in range(max_points)]
+        filtered_records = sampled_records
+
+    # Calculate map center
+    center_lat, center_lon = calculate_map_center(filtered_records)
+
+    # Create Folium map
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=13,
+        tiles="OpenStreetMap"
+    )
+
+    # Add polyline showing movement trajectory
+    path_coords = [[_get_record_field(r, 'latitude'), _get_record_field(r, 'longitude')] for r in filtered_records]
+    folium.PolyLine(
+        path_coords,
+        color="blue",
+        weight=2,
+        opacity=0.7,
+        popup="Data collection path"
+    ).add_to(m)
+
+    # Add circle markers at each point
+    anomaly_count = 0
+    for record in filtered_records:
+        # Get color based on selected metric
+        if color_by == "anomaly":
+            color = get_color_for_metric(_get_record_field(record, 'is_anomaly'), "anomaly")
+        else:
+            metric_value = _get_record_field(record, color_by)
+            color = get_color_for_metric(metric_value, color_by)
+
+        if _get_record_field(record, 'is_anomaly'):
+            anomaly_count += 1
+
+        # Create marker with popup
+        folium.CircleMarker(
+            location=[_get_record_field(record, 'latitude'), _get_record_field(record, 'longitude')],
+            radius=6,
+            color=color,
+            fill=True,
+            fillColor=color,
+            fillOpacity=0.7,
+            popup=folium.Popup(create_popup_html(record), max_width=300)
+        ).add_to(m)
+
+    # Add legend
+    legend_html = f"""
+    <div style="position: fixed;
+                bottom: 50px; right: 50px; width: 200px; height: auto;
+                background-color: white; border:2px solid grey; z-index:9999;
+                font-size:14px; padding: 10px; border-radius: 5px;">
+        <h4 style="margin-top:0;">Signal Quality Legend</h4>
+        <p style="margin: 5px 0;"><b>Color by: {color_by.upper()}</b></p>
+    """
+
+    if color_by == "rsrp":
+        legend_html += """
+        <p style="margin: 5px 0;"><span style="color: #00ff00;">&#9679;</span> Excellent (≥ -80 dBm)</p>
+        <p style="margin: 5px 0;"><span style="color: #ffff00;">&#9679;</span> Fair (-100 to -80 dBm)</p>
+        <p style="margin: 5px 0;"><span style="color: #ff0000;">&#9679;</span> Poor (< -100 dBm)</p>
+        """
+    elif color_by == "sinr":
+        legend_html += """
+        <p style="margin: 5px 0;"><span style="color: #00ff00;">&#9679;</span> Excellent (≥ 15 dB)</p>
+        <p style="margin: 5px 0;"><span style="color: #ffff00;">&#9679;</span> Fair (0 to 15 dB)</p>
+        <p style="margin: 5px 0;"><span style="color: #ff0000;">&#9679;</span> Poor (< 0 dB)</p>
+        """
+    elif color_by == "rsrq":
+        legend_html += """
+        <p style="margin: 5px 0;"><span style="color: #00ff00;">&#9679;</span> Excellent (≥ -10 dB)</p>
+        <p style="margin: 5px 0;"><span style="color: #ffff00;">&#9679;</span> Fair (-15 to -10 dB)</p>
+        <p style="margin: 5px 0;"><span style="color: #ff0000;">&#9679;</span> Poor (< -15 dB)</p>
+        """
+    elif color_by == "rssi":
+        legend_html += """
+        <p style="margin: 5px 0;"><span style="color: #00ff00;">&#9679;</span> Excellent (≥ -65 dBm)</p>
+        <p style="margin: 5px 0;"><span style="color: #ffff00;">&#9679;</span> Fair (-85 to -65 dBm)</p>
+        <p style="margin: 5px 0;"><span style="color: #ff0000;">&#9679;</span> Poor (< -85 dBm)</p>
+        """
+
+    legend_html += """
+        <p style="margin: 5px 0; margin-top: 10px;"><span style="color: blue;">─</span> Collection path</p>
+    </div>
+    """
+
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    # Save to temp file with timestamp
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    temp_dir = tempfile.gettempdir()
+    map_filename = f"signal_map_{timestamp_str}.html"
+    map_path = os.path.join(temp_dir, map_filename)
+
+    m.save(map_path)
+
+    # Calculate coordinate bounds
+    min_lat = min(_get_record_field(r, 'latitude') for r in filtered_records)
+    max_lat = max(_get_record_field(r, 'latitude') for r in filtered_records)
+    min_lon = min(_get_record_field(r, 'longitude') for r in filtered_records)
+    max_lon = max(_get_record_field(r, 'longitude') for r in filtered_records)
+
+    # Auto-open in browser
+    webbrowser.open('file://' + os.path.abspath(map_path))
+
+    # Return result
+    result = {
+        "status": "success",
+        "map_file": map_path,
+        "format": output_format,
+        "records_plotted": len(filtered_records),
+        "anomalies_plotted": anomaly_count,
+        "coordinate_bounds": {
+            "min_latitude": round(min_lat, 6),
+            "max_latitude": round(max_lat, 6),
+            "min_longitude": round(min_lon, 6),
+            "max_longitude": round(max_lon, 6),
+            "center_latitude": round(center_lat, 6),
+            "center_longitude": round(center_lon, 6)
+        },
+        "color_by": color_by,
+        "message": f"Map opened in browser with {len(filtered_records)} points"
+    }
+
+    return json.dumps(result, indent=2)
+
+
 # Can be used for testing and debugging
 def test():
     """Gets the most recent temperature from the Arduino"""
@@ -739,12 +1353,15 @@ if __name__ == "__main__":
 
     try:
 
-        # For demonstrating that Arduino is connected
-        board.red_LED()
-        time.sleep(1)
-        board.yellow_LED()
-        time.sleep(1)
-        board.off()
+        # For demonstrating that Arduino is connected (only if connected)
+        if board.connected:
+            board.red_LED()
+            time.sleep(1)
+            board.yellow_LED()
+            time.sleep(1)
+            board.off()
+        else:
+            logger.info("Arduino not connected, skipping LED tests")
 
         # Runs the MCP server
         ArduinoMCP.run()
